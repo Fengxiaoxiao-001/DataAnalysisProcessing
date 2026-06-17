@@ -63,6 +63,10 @@ class ExcelLoader:
         path = Path(path)
         suffix = path.suffix.lower()
 
+        if not path.exists():
+            raise FileNotFoundError(f"目标文件不存在：{path.resolve()}")
+
+        suffix = path.suffix.lower()
         if suffix not in self.loaders:
             raise ValueError(f"不支持的文件类型: {suffix}")
 
