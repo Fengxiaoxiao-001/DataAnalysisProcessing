@@ -14,7 +14,7 @@ class TestTempCSV:
     def __init__(self,
                  data: pd.DataFrame,
                  save_dir: str | Path | None = None,
-                 insert_null: bool = True,
+                 insert_null: bool = False,
                  null_ratio: float = 0.2
                  ) -> None:
         # 用户传None，就使用预设默认路径

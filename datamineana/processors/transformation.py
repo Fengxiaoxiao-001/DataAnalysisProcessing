@@ -1,5 +1,25 @@
 # datamineana/processors/transformation.py
-
+"""
+一、类定位
+继承 BaseProcessor，属于数据变换与通用特征工程处理器，负责对数值、类别、时间字段做特征变换，为机器学习建模做特征预处理。每次操作自动生成标准化处理报告，全量留存历史执行日志。
+二、核心方法功能
+scale 数值标准化缩放
+支持三种常用归一化方式：
+minmax：最小最大归一化缩放到[0,1]
+standard：Z-score 标准化，均值 0 方差 1
+robust：基于四分位数的鲁棒缩放，抗异常值；
+会保存每一列缩放用的统计参数（均值、极值、四分位数等），方便后续线上推理复用。
+log_transform 对数变换
+对数值列做对数变换修正偏态分布，设置偏移量避免负数 / 零报错，会跳过不符合取值要求的列并记录跳过字段。
+binning 连续特征离散分箱
+通过指定分箱边界或分箱数量，将连续数值转为分类类别，支持自定义标签与新列名，统计每个分箱样本分布。
+one_hot_encode 类别特征独热编码
+对分类字段生成虚拟哑变量，支持丢弃第一列、空值单独编码，自动记录所有新增的编码衍生列。
+datetime_features 单时间列特征提取
+从单个时间字段拆分出年、月、日、星期、小时特征，可选择删除原时间列，记录所有生成的时间衍生字段。
+extract_datetime_features 批量时间特征提取
+支持批量处理多个时间列，除常规时间维度外，额外新增月初、月末标记，记录成功 / 失败的字段列表，统一上报执行状态、新增特征数量。
+"""
 from __future__ import annotations
 
 from typing import Any, Iterable, List, Optional, Sequence, cast
@@ -7,15 +27,14 @@ from typing import Any, Iterable, List, Optional, Sequence, cast
 import numpy as np
 import pandas as pd
 
-from datamineana.dataobject.DataSelf import TabularData
-from .report import ProcessReport
+from .base import BaseProcessor
 from .utils import (
     ensure_tabular,
-    make_tabular_like,
     numeric_columns,
     safe_columns,
     to_dataframe,
 )
+from datamineana.dataobject import TabularData
 
 
 def _ensure_series(obj: Any) -> pd.Series:
@@ -36,7 +55,7 @@ def _dt_part(series: pd.Series, attr: str) -> pd.Series:
     return cast(pd.Series, getattr(series.dt, attr))
 
 
-class DataTransformer:
+class DataTransformer(BaseProcessor):
     """
     数据变换和特征工程模块。
 
@@ -50,9 +69,6 @@ class DataTransformer:
     7. 日期时间特征工程
     """
     name = "data_transformer"
-
-    def __init__(self):
-        self.last_report: Optional[ProcessReport] = None
 
     def scale(
             self,
@@ -76,16 +92,14 @@ class DataTransformer:
 
         target_columns = safe_columns(result, columns) if columns else numeric_columns(result)
 
-        report = ProcessReport(
-            module="transformation",
-            method="scale",
+        report = self._new_report(
+            step="scale",
             params={"method": method, "columns": target_columns},
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
-        params = {}
-
+        scale_params = {}
         for col in target_columns:
             s = result[col]
 
@@ -93,46 +107,34 @@ class DataTransformer:
                 min_v = s.min()
                 max_v = s.max()
                 denom = max_v - min_v
-                if denom == 0:
-                    result[col] = 0
-                else:
-                    result[col] = (s - min_v) / denom
-                params[col] = {"min": float(min_v), "max": float(max_v)}
+                result[col] = 0 if denom == 0 else (s - min_v) / denom
+                scale_params[col] = {"min": float(min_v), "max": float(max_v)}
 
             elif method == "standard":
                 mean = s.mean()
                 std = s.std()
-                if std == 0:
-                    result[col] = 0
-                else:
-                    result[col] = (s - mean) / std
-                params[col] = {"mean": float(mean), "std": float(std)}
+                result[col] = 0 if std == 0 else (s - mean) / std
+                scale_params[col] = {"mean": float(mean), "std": float(std)}
 
             elif method == "robust":
                 median = s.median()
                 q1 = s.quantile(0.25)
                 q3 = s.quantile(0.75)
                 iqr = q3 - q1
-                if iqr == 0:
-                    result[col] = 0
-                else:
-                    result[col] = (s - median) / iqr
-                params[col] = {"median": float(median), "iqr": float(iqr)}
+                result[col] = 0 if iqr == 0 else (s - median) / iqr
+                scale_params[col] = {"median": float(median), "iqr": float(iqr)}
 
             else:
                 raise ValueError(f"未知缩放方法: {method}")
 
-        report.after_shape = result.shape
-        report.add_metric("scale_params", params)
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {"scale_params": scale_params}
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataTransformer.scale",
-            report=report,
-        )
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def log_transform(
             self,
@@ -151,16 +153,14 @@ class DataTransformer:
 
         target_columns = safe_columns(result, columns) if columns else numeric_columns(result)
 
-        report = ProcessReport(
-            module="transformation",
-            method="log_transform",
+        report = self._new_report(
+            step="log_transform",
             params={"columns": target_columns, "offset": offset},
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
         skipped = []
-
         for col in target_columns:
             min_v = result[col].min()
             if min_v + offset <= 0:
@@ -168,17 +168,17 @@ class DataTransformer:
                 continue
             result[col] = np.log(result[col] + offset)
 
-        report.after_shape = result.shape
-        report.add_metric("skipped_columns", skipped)
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {
+            "skipped_columns": skipped,
+            "skipped_count": len(skipped),
+        }
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataTransformer.log_transform",
-            report=report,
-        )
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def binning(
             self,
@@ -202,34 +202,32 @@ class DataTransformer:
         if column not in result.columns:
             raise ValueError(f"列不存在: {column}")
 
-        report = ProcessReport(
-            module="transformation",
-            method="binning",
+        report = self._new_report(
+            step="binning",
             params={
                 "column": column,
                 "bins": bins,
                 "labels": labels,
                 "new_column": new_column,
             },
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
         output_col = new_column or f"{column}_bin"
         result[output_col] = pd.cut(result[column], bins=bins, labels=labels)
 
-        report.after_shape = result.shape
-        report.add_metric("output_column", output_col)
-        report.add_metric("value_counts", result[output_col].value_counts(dropna=False).to_dict())
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {
+            "output_column": output_col,
+            "value_counts": result[output_col].value_counts(dropna=False).to_dict(),
+        }
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataTransformer.binning",
-            report=report,
-        )
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def one_hot_encode(
             self,
@@ -248,15 +246,14 @@ class DataTransformer:
 
         target_columns = safe_columns(df, columns)
 
-        report = ProcessReport(
-            module="transformation",
-            method="one_hot_encode",
+        report = self._new_report(
+            step="one_hot_encode",
             params={
                 "columns": target_columns,
                 "drop_first": drop_first,
                 "dummy_na": dummy_na,
             },
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
@@ -266,18 +263,19 @@ class DataTransformer:
             drop_first=drop_first,
             dummy_na=dummy_na,
         )
+        created_columns = [c for c in result.columns if c not in df.columns]
 
-        report.after_shape = result.shape
-        report.add_metric("created_columns", [c for c in result.columns if c not in df.columns])
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {
+            "created_columns": created_columns,
+            "created_count": len(created_columns),
+        }
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataTransformer.one_hot_encode",
-            report=report,
-        )
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def datetime_features(
             self,
@@ -298,15 +296,14 @@ class DataTransformer:
         if column not in result.columns:
             raise ValueError(f"列不存在: {column}")
 
-        report = ProcessReport(
-            module="transformation",
-            method="datetime_features",
+        report = self._new_report(
+            step="datetime_features",
             params={
                 "column": column,
                 "drop_original": drop_original,
                 "prefix": prefix,
             },
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
@@ -322,17 +319,19 @@ class DataTransformer:
         if drop_original:
             result = result.drop(columns=[column])
 
-        report.after_shape = result.shape
-        report.add_metric("created_columns", [c for c in result.columns if c not in df.columns])
+        created_columns = [c for c in result.columns if c not in df.columns]
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataTransformer.datetime_features",
-            report=report,
-        )
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {
+            "created_columns": created_columns,
+            "created_count": len(created_columns),
+        }
+        report.finish()
+
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def extract_datetime_features(
             self,
@@ -351,7 +350,7 @@ class DataTransformer:
                 "prefix": prefix,
                 "drop_original": drop_original,
             },
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
@@ -385,13 +384,9 @@ class DataTransformer:
                 result[is_month_end_col] = _dt_part(dt, "is_month_end")
 
                 created_columns.extend([
-                    year_col,
-                    month_col,
-                    day_col,
-                    dayofweek_col,
-                    hour_col,
-                    is_month_start_col,
-                    is_month_end_col,
+                    year_col, month_col, day_col,
+                    dayofweek_col, hour_col,
+                    is_month_start_col, is_month_end_col,
                 ])
 
                 if drop_original:
@@ -400,19 +395,30 @@ class DataTransformer:
             except Exception as e:
                 failed_columns.append(f"{col}: {repr(e)}")
 
-        report.after_shape = result.shape
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
         report.statistics = {
             "created_columns": created_columns,
             "created_count": len(created_columns),
             "failed_columns": failed_columns,
             "failed_count": len(failed_columns),
         }
-        report.success = len(failed_columns) == 0
         report.finish(success=len(failed_columns) == 0)
 
-        return make_tabular_like(
-            data,
-            result,
+        return self._wrap_result(data, result, report)
+
+    def _wrap_result(self, source: TabularData, df: pd.DataFrame, report) -> TabularData:
+        metadata = dict(source.metadata or {})
+        process_reports = list(metadata.get("process_reports", []))
+        process_reports.append(report.to_dict())
+        metadata["process_reports"] = process_reports
+
+        return TabularData.from_dataframe(
+            df,
+            name=source.name,
+            description=source.description,
+            source_path=source.source_path,
+            source_type=source.source_type,
+            file_type=source.file_type,
+            metadata=metadata,
             processed_by=self.name,
-            report=report,
         )

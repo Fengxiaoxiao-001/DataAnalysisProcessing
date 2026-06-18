@@ -1,17 +1,33 @@
 # datamineana/processors/reduction.py
-
+"""
+一、类定位
+继承 BaseProcessor，属于数据规约处理器，用于从特征、样本、内存三个维度精简数据集，降低数据规模、减少冗余，提升后续建模与运算效率。每次操作自动生成标准化处理报告，同时向下兼容旧代码的 last_report 读取逻辑。
+二、四个核心方法功能
+select_features 特征筛选
+支持三种筛选规则精简特征：
+missing_rate：删除缺失率超过阈值的列；
+variance：删除数值列中方差过低的弱区分特征；
+correlation：剔除高相关性冗余特征，避免多重共线性；
+会记录被删除的字段列表。
+pca 主成分降维
+对数值特征做标准化 + PCA 降维，可按指定维度数或方差保留比例压缩特征；支持保留非数值字段，输出命名为 PC 开头的新特征，记录方差解释率、最终保留主成分数量。
+sample 样本抽样
+支持按样本数量n、比例frac随机采样，也可基于指定列做分层抽样，保证各类别分布不变；记录抽样后的样本行数，用于缩减大数据量训练集。
+optimize_memory 内存优化
+调用工具函数自动向下适配数值类型、低基数对象列转 category，统计优化前后内存占用、节省内存大小与压缩率，减少数据集内存开销。
+"""
 from __future__ import annotations
 
 from typing import Iterable, Optional
 
 import pandas as pd
 
-from datamineana.dataobject.DataSelf import TabularData
-from .report import ProcessReport
-from .utils import ensure_tabular, make_tabular_like, numeric_columns, safe_columns, to_dataframe
+from .base import BaseProcessor
+from .utils import ensure_tabular, numeric_columns, safe_columns, to_dataframe, ProcessReport
+from datamineana.dataobject import TabularData
 
 
-class DataReducer:
+class DataReducer(BaseProcessor):
     """
     数据规约模块。
 
@@ -24,8 +40,7 @@ class DataReducer:
     6. 内存优化
     """
 
-    def __init__(self):
-        self.last_report: Optional[ProcessReport] = None
+    name = "data_reducer"
 
     def select_features(
             self,
@@ -48,15 +63,15 @@ class DataReducer:
         df = to_dataframe(data)
         result = df.copy()
 
-        report = ProcessReport(
-            module="reduction",
-            method="select_features",
+        # 新版体系：标准报告创建
+        report = self._new_report(
+            step="select_features",
             params={
                 "method": method,
                 "threshold": threshold,
                 "columns": list(columns) if columns else None,
             },
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
@@ -72,62 +87,48 @@ class DataReducer:
             dropped = variances[variances <= threshold].index.tolist()
             result = result.drop(columns=dropped)
 
-
         elif method == "correlation":
-
             import numpy as np
 
             target_columns = safe_columns(result, columns) if columns else numeric_columns(result)
-
             corr = result[target_columns].corr().abs()
-
             upper_mask = np.triu(np.ones(corr.shape), k=1).astype(bool)
-
             upper = corr.where(upper_mask)
-
             dropped = [
-
                 column for column in upper.columns
-
                 if any(upper[column] > threshold)
-
             ]
-
             result = result.drop(columns=dropped)
 
         else:
             raise ValueError(f"未知特征筛选方法: {method}")
 
-        report.after_shape = result.shape
-        report.add_metric("dropped_columns", dropped)
-
-        import numpy as np
-        corr = result[target_columns].corr().abs()
-        upper_mask = np.triu(np.ones(corr.shape), k=1).astype(bool)
-        upper = corr.where(upper_mask)
-
-        dropped = [
-            column for column in upper.columns
-            if bool((upper[column] > threshold).any())
-        ]
-
-        result = result.drop(columns=dropped)
-
+        # 新版体系：报告指标与收尾
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
         report.statistics = {
-            "method": "correlation",
+            "method": method,
             "threshold": threshold,
             "dropped_columns": dropped,
             "dropped_count": len(dropped),
         }
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataReducer.select_features",
-            report=report,
+        # 兼容旧版 self.last_report
+        self.last_report = ProcessReport(
+            module="reduction",
+            method="select_features",
+            params=report.params,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
+            after_shape=(int(result.shape[0]), int(result.shape[1])),
+            materialized=True,
         )
+        self.last_report.add_metric("dropped_columns", dropped)
+
+        # 新版体系：结果封装 + 兼容name参数
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def pca(
             self,
@@ -156,16 +157,16 @@ class DataReducer:
 
         target_columns = safe_columns(df, columns) if columns else numeric_columns(df)
 
-        report = ProcessReport(
-            module="reduction",
-            method="pca",
+        # 新版体系：标准报告创建
+        report = self._new_report(
+            step="pca",
             params={
                 "columns": target_columns,
                 "n_components": n_components,
                 "prefix": prefix,
                 "keep_non_numeric": keep_non_numeric,
             },
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
@@ -187,19 +188,33 @@ class DataReducer:
         else:
             result = pc_df
 
-        report.after_shape = result.shape
-        report.add_metric("explained_variance_ratio", model.explained_variance_ratio_.tolist())
-        report.add_metric("total_explained_variance", float(model.explained_variance_ratio_.sum()))
-        report.add_metric("n_components_", int(model.n_components_))
+        # 新版体系：报告指标与收尾
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {
+            "explained_variance_ratio": model.explained_variance_ratio_.tolist(),
+            "total_explained_variance": float(model.explained_variance_ratio_.sum()),
+            "n_components_": int(model.n_components_),
+        }
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataReducer.pca",
-            report=report,
+        # 兼容旧版 self.last_report
+        self.last_report = ProcessReport(
+            module="reduction",
+            method="pca",
+            params=report.params,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
+            after_shape=(int(result.shape[0]), int(result.shape[1])),
+            materialized=True,
         )
+        self.last_report.add_metric("explained_variance_ratio", model.explained_variance_ratio_.tolist())
+        self.last_report.add_metric("total_explained_variance", float(model.explained_variance_ratio_.sum()))
+        self.last_report.add_metric("n_components_", int(model.n_components_))
+
+        # 新版体系：结果封装 + 兼容name参数
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def sample(
             self,
@@ -220,16 +235,16 @@ class DataReducer:
         ensure_tabular(data)
         df = to_dataframe(data)
 
-        report = ProcessReport(
-            module="reduction",
-            method="sample",
+        # 新版体系：标准报告创建
+        report = self._new_report(
+            step="sample",
             params={
                 "n": n,
                 "frac": frac,
                 "random_state": random_state,
                 "stratify_by": stratify_by,
             },
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
@@ -249,17 +264,29 @@ class DataReducer:
         else:
             result = df.sample(n=n, frac=frac, random_state=random_state)
 
-        report.after_shape = result.shape
-        report.add_metric("sampled_rows", int(len(result)))
+        # 新版体系：报告指标与收尾
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {
+            "sampled_rows": int(len(result)),
+        }
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataReducer.sample",
-            report=report,
+        # 兼容旧版 self.last_report
+        self.last_report = ProcessReport(
+            module="reduction",
+            method="sample",
+            params=report.params,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
+            after_shape=(int(result.shape[0]), int(result.shape[1])),
+            materialized=True,
         )
+        self.last_report.add_metric("sampled_rows", int(len(result)))
+
+        # 新版体系：结果封装 + 兼容name参数
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
 
     def optimize_memory(
             self,
@@ -274,28 +301,62 @@ class DataReducer:
 
         before_mb = estimate_memory_mb(df)
 
-        report = ProcessReport(
-            module="reduction",
-            method="optimize_memory",
+        # 新版体系：标准报告创建
+        report = self._new_report(
+            step="optimize_memory",
             params={},
-            before_shape=df.shape,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
             materialized=True,
         )
 
         result = reduce_memory_usage(df)
         after_mb = estimate_memory_mb(result)
 
-        report.after_shape = result.shape
-        report.add_metric("memory_before_mb", before_mb)
-        report.add_metric("memory_after_mb", after_mb)
-        report.add_metric("memory_saved_mb", before_mb - after_mb)
-        report.add_metric("memory_saved_rate", 0 if before_mb == 0 else (before_mb - after_mb) / before_mb)
+        # 新版体系：报告指标与收尾
+        saved_mb = before_mb - after_mb
+        saved_rate = 0 if before_mb == 0 else saved_mb / before_mb
+        report.after_shape = (int(result.shape[0]), int(result.shape[1]))
+        report.statistics = {
+            "memory_before_mb": before_mb,
+            "memory_after_mb": after_mb,
+            "memory_saved_mb": saved_mb,
+            "memory_saved_rate": saved_rate,
+        }
+        report.finish()
 
-        self.last_report = report
-        return make_tabular_like(
-            data,
-            result,
-            name=name,
-            processed_by="DataReducer.optimize_memory",
-            report=report,
+        # 兼容旧版 self.last_report
+        self.last_report = ProcessReport(
+            module="reduction",
+            method="optimize_memory",
+            params=report.params,
+            before_shape=(int(df.shape[0]), int(df.shape[1])),
+            after_shape=(int(result.shape[0]), int(result.shape[1])),
+            materialized=True,
+        )
+        self.last_report.add_metric("memory_before_mb", before_mb)
+        self.last_report.add_metric("memory_after_mb", after_mb)
+        self.last_report.add_metric("memory_saved_mb", saved_mb)
+        self.last_report.add_metric("memory_saved_rate", saved_rate)
+
+        # 新版体系：结果封装 + 兼容name参数
+        result_data = self._wrap_result(data, result, report)
+        if name is not None:
+            result_data.name = name
+        return result_data
+
+    def _wrap_result(self, source: TabularData, df: pd.DataFrame, report) -> TabularData:
+        metadata = dict(source.metadata or {})
+        process_reports = list(metadata.get("process_reports", []))
+        process_reports.append(report.to_dict())
+        metadata["process_reports"] = process_reports
+
+        return TabularData.from_dataframe(
+            df,
+            name=source.name,
+            description=source.description,
+            source_path=source.source_path,
+            source_type=source.source_type,
+            file_type=source.file_type,
+            metadata=metadata,
+            processed_by=self.name,
         )

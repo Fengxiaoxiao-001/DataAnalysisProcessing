@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from datamineana.dataobject.DataSelf import TabularData
 
@@ -12,7 +12,7 @@ from .transformation import DataTransformer
 from .reduction import DataReducer
 from .splitting import DataSplitter
 from .timeseries import TimeSeriesProcessor
-from .report import ProcessReport
+from .base import ProcessReport
 from .utils import ensure_tabular
 
 
@@ -51,6 +51,19 @@ class DataPreprocessor:
             return None
         return self.reports[-1].to_dict()
 
+    def get_module_reports(self, module_name: str) -> list[dict[str, Any]]:
+        """获取指定子处理器的全部历史报告"""
+        module_map = {
+            "cleaner": self.cleaner,
+            "integrator": self.integrator,
+            "transformer": self.transformer,
+            "reducer": self.reducer,
+            "splitter": self.splitter,
+            "timeseries": self.timeseries,
+        }
+        module = module_map.get(module_name)
+        return module.get_reports() if module else []
+
     def clear_reports(self) -> None:
         self.reports.clear()
 
@@ -79,7 +92,7 @@ class DataPreprocessor:
         return result
 
     def convert_types(self, data: TabularData, **kwargs) -> TabularData:
-        result = self.cleaner.convert_types(data, **kwargs)
+        result = self.cleaner.convert_dtypes_by_mapping(data, **kwargs)
         self._collect_report(self.cleaner)
         return result
 
@@ -169,8 +182,8 @@ class DataPreprocessor:
     # 数据划分
     # =========================
 
-    def train_valid_test_split(self, data: TabularData, **kwargs) -> Dict[str, TabularData]:
-        result = self.splitter.train_valid_test_split(data, **kwargs)
+    def train_valid_test_split(self, data: TabularData, **kwargs) -> Tuple[TabularData, TabularData, TabularData]:
+        result = self.splitter.random_split(data, **kwargs)
         self._collect_report(self.splitter)
         return result
 
